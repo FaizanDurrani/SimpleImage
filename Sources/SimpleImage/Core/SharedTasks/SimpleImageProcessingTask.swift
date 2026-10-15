@@ -7,15 +7,18 @@
 
 
 import Foundation
-import UIKit
 
+/// Applies the request's processors and caches the result.
 final class SimpleImageProcessingTask: SimpleImageSharedTask, @unchecked Sendable {
   init(
     imageRequest: SimpleImageRequest,
-    image: UIImage,
-    completionHandler: @escaping @Sendable (SimpleImageSharedTask, Result<UIImage, Error>, String?) -> Void,
+    image: any ProcessedImage,
+    decoders: [any SimpleImageDecoder],
+    memoryCache: SimpleImageMemoryCaching,
+    processedDiskCache: SimpleImageDataCaching,
+    onFinish: @escaping @Sendable (SimpleImageSharedTask) -> Void,
   ) {
-    super.init(request: imageRequest.urlRequest, completionHandler: completionHandler)
+    super.init(request: imageRequest.urlRequest, onFinish: onFinish)
     
     self.state = .waiting { [weak self] in
       guard let self else { return }
@@ -28,9 +31,15 @@ final class SimpleImageProcessingTask: SimpleImageSharedTask, @unchecked Sendabl
           image = try await processor.process(image: image)
         }
         
-        self.finish(with: .success(image), cacheKey: imageRequest.cacheKey)
+        memoryCache.store(image, forKey: imageRequest.cacheKey)
+        self.finish(with: .success(.image(image)))
+        
+        // Persist after delivering; the memory cache serves requests meanwhile.
+        if let data = decoders.encode(processedImage: image) {
+          try? await processedDiskCache.store(data, forKey: imageRequest.cacheKey)
+        }
       } catch {
-        self.finish(with: .failure(error), cacheKey: nil)
+        self.finish(with: .failure(error))
       }
     }
   }

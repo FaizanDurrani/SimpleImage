@@ -7,41 +7,39 @@
 
 
 import Foundation
-import UIKit
 
+/// Loads the original image bytes from the original disk cache or the network.
+/// Network bytes are persisted by `SimpleImageDecodingTask` once they decode.
 final class SimpleImageDownloadTask: SimpleImageSharedTask, @unchecked Sendable {
   init(
     imageRequest: SimpleImageRequest,
     imageLoader: SimpleImageLoader,
     imageTransformers: [SimpleImageTransformer],
-    imageCache: SimpleImageCache,
-    completionHandler: @escaping @Sendable (SimpleImageSharedTask, Result<UIImage, Error>, String?) -> Void,
+    originalDiskCache: SimpleImageDataCaching,
+    onFinish: @escaping @Sendable (SimpleImageSharedTask) -> Void,
   ) {
-    super.init(request: imageRequest.urlRequest, completionHandler: completionHandler)
+    super.init(request: imageRequest.urlRequest, onFinish: onFinish)
     
     self.state = .waiting { [weak self] in
       guard let self else { return }
       
       do {
-        if let image = try await imageCache.retrieveImage(forKey: imageRequest.unprocessedCacheKey) {
-          self.finish(with: .success(image), cacheKey: nil)
-        } else {
-          var imageData = try await imageLoader.imageData(for: imageRequest.urlRequest, progressHandler: { [weak self] in self?.reportProgress($0) })
-          
-          for imageTransformer in imageTransformers {
-            try Task.checkCancellation()
-            imageData = try await imageTransformer.transform(data: imageData)
-          }
-          
-          try Task.checkCancellation()
-          guard let finalImage = UIImage(data: imageData) else {
-            throw SimpleImageError.invalidImageData
-          }
-          
-          self.finish(with: .success(finalImage), cacheKey: imageRequest.unprocessedCacheKey)
+        if let data = try? await originalDiskCache.data(forKey: imageRequest.unprocessedCacheKey) {
+          self.finish(with: .success(.raw(RawImage(data: data), isFromDiskCache: true)))
+          return
         }
+        
+        var imageData = try await imageLoader.imageData(for: imageRequest.urlRequest, progressHandler: { [weak self] in self?.reportProgress($0) })
+        
+        for imageTransformer in imageTransformers {
+          try Task.checkCancellation()
+          imageData = try await imageTransformer.transform(data: imageData)
+        }
+        
+        try Task.checkCancellation()
+        self.finish(with: .success(.raw(RawImage(data: imageData), isFromDiskCache: false)))
       } catch {
-        self.finish(with: .failure(error), cacheKey: nil)
+        self.finish(with: .failure(error))
       }
     }
   }

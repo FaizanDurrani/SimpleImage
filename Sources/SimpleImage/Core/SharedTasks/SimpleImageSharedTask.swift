@@ -7,13 +7,17 @@
 
 
 import Foundation
-import UIKit
+
+enum SimpleImageStageOutput: Sendable {
+  case raw(RawImage, isFromDiskCache: Bool)
+  case image(any ProcessedImage)
+}
 
 class SimpleImageSharedTask: @unchecked Sendable {
   enum State {
     case waiting(work: @isolated(any) @Sendable () async -> Void)
     case working(Task<Void, Never>)
-    case finished(result: Result<UIImage, Error>, cacheKey: String?)
+    case finished(result: Result<SimpleImageStageOutput, Error>)
     case cancelled
   }
   
@@ -29,20 +33,20 @@ class SimpleImageSharedTask: @unchecked Sendable {
   private nonisolated(unsafe) var children: [UUID: SimpleImageTask]
   
   private let lock = NSLock()
-  private let completionHandler: @Sendable (SimpleImageSharedTask, Result<UIImage, Error>, String?) -> Void
+  private let onFinish: @Sendable (SimpleImageSharedTask) -> Void
   
   init(
     request: URLRequest,
-    completionHandler: @escaping @Sendable (SimpleImageSharedTask, Result<UIImage, Error>, String?) -> Void,
+    onFinish: @escaping @Sendable (SimpleImageSharedTask) -> Void,
   ) {
     self.children = [:]
     self.request = request
-    self.completionHandler = completionHandler
+    self.onFinish = onFinish
   }
   
   enum AttachResult {
     case attached
-    case finished(Result<UIImage, Error>)
+    case finished(Result<SimpleImageStageOutput, Error>)
     case cancelled
   }
 
@@ -58,7 +62,7 @@ class SimpleImageSharedTask: @unchecked Sendable {
           self.children[task.id] = task
           return .attached
 
-        case .finished(let result, _):
+        case .finished(let result):
           return .finished(result)
 
         case .cancelled:
@@ -94,7 +98,7 @@ class SimpleImageSharedTask: @unchecked Sendable {
     guard didCancel else { return }
 
     underlyingTask?.cancel()
-    self.completionHandler(self, .failure(CancellationError()), nil)
+    self.onFinish(self)
   }
   
   func reportProgress(_ fraction: Double) {
@@ -102,7 +106,7 @@ class SimpleImageSharedTask: @unchecked Sendable {
     subscribers.forEach { $0.reportProgress(fraction) }
   }
 
-  func finish(with result: Result<UIImage, Error>, cacheKey: String?) {
+  func finish(with result: Result<SimpleImageStageOutput, Error>) {
     self.lock.lock()
     guard case .working = self.state else {
       self.lock.unlock()
@@ -110,14 +114,46 @@ class SimpleImageSharedTask: @unchecked Sendable {
     }
     
     let children = self.children
-    self.state = .finished(result: result, cacheKey: cacheKey)
+    self.state = .finished(result: result)
     self.children.removeAll()
     
     self.lock.unlock()
     
-    self.completionHandler(self, result, cacheKey)
+    self.onFinish(self)
     for (_, child) in children {
-      child.processImageResult(result)
+      child.processStageResult(result, from: self)
+    }
+  }
+}
+
+/// Coalesces shared tasks by key until they finish or are cancelled.
+final class SimpleImageSharedTaskRegistry<SharedTask: SimpleImageSharedTask>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var tasks: [String: SharedTask] = [:]
+  
+  func task(
+    forKey key: String,
+    make: (_ onFinish: @escaping @Sendable (SimpleImageSharedTask) -> Void) -> SharedTask
+  ) -> SharedTask {
+    self.lock.withLock {
+      if let task = self.tasks[key], !task.isCancelled {
+        return task
+      }
+      
+      let task = make { [weak self] finishedTask in
+        self?.removeTask(finishedTask, forKey: key)
+      }
+      
+      self.tasks[key] = task
+      return task
+    }
+  }
+  
+  private func removeTask(_ task: SimpleImageSharedTask, forKey key: String) {
+    self.lock.withLock {
+      if self.tasks[key] === task {
+        self.tasks.removeValue(forKey: key)
+      }
     }
   }
 }

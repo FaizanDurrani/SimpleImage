@@ -8,6 +8,7 @@ import UIKit
 #else
 import Cocoa
 #endif
+import SimpleImage
 
 /// An LRU memory cache.
 ///
@@ -20,7 +21,7 @@ import Cocoa
 /// memory warning. On iOS, tvOS, and visionOS, it also automatically removes
 /// *most* stored elements when the app enters the background.
 public final class ImageCache: Sendable {
-    private let impl: Cache<String, UIImage>
+    private let impl: Cache<String, any ProcessedImage>
 
     /// The maximum total cost that the cache can hold.
     public var costLimit: Int {
@@ -72,11 +73,11 @@ public final class ImageCache: Sendable {
         return min(calculated, 805_306_368) // 768 MB
     }
 
-    public subscript(key: String) -> UIImage? {
+    public subscript(key: String) -> (any ProcessedImage)? {
         get { impl.value(forKey: key) }
         set {
             if let image = newValue {
-                impl.set(image, forKey: key, cost: cost(for: image))
+                impl.set(image, forKey: key, cost: image.cost)
             } else {
                 impl.removeValue(forKey: key)
             }
@@ -98,16 +99,5 @@ public final class ImageCache: Sendable {
     /// of the remaining items is less than the given count limit.
     public func trim(toCount limit: Int) {
         impl.trim(toCount: limit)
-    }
-
-    /// Returns cost for the given image by approximating its bitmap size in bytes in memory.
-    func cost(for image: UIImage) -> Int {
-        // bytesPerRow * height gives a rough estimation of how much memory
-        // image uses in bytes. In practice this algorithm combined with a
-        // conservative default cost limit works OK.
-        guard let cgImage = image.cgImage else {
-            return 1
-        }
-        return cgImage.bytesPerRow * cgImage.height
     }
 }

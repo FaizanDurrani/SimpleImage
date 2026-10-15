@@ -7,24 +7,23 @@
 
 import Foundation
 import SimpleImage
-import UIKit
 
-public final class SimpleImageMemoryCache: SimpleImageCache {
+public final class SimpleImageMemoryCache: SimpleImageMemoryCaching {
   public let imageCache: ImageCache
   
   public init(imageCache: ImageCache) {
     self.imageCache = imageCache
   }
   
-  public func cacheImage(_ image: UIImage, forKey cacheKey: String) async throws {
+  public func image(forKey cacheKey: String) -> (any ProcessedImage)? {
+    self.imageCache[cacheKey]
+  }
+  
+  public func store(_ image: any ProcessedImage, forKey cacheKey: String) {
     self.imageCache[cacheKey] = image
   }
   
-  public func retrieveImage(forKey cacheKey: String) async throws -> UIImage? {
-    return self.imageCache[cacheKey]
-  }
-  
-  public func imageIsCached(forKey cacheKey: String) async -> Bool {
-    return self.imageCache[cacheKey] != nil
+  public func removeImage(forKey cacheKey: String) {
+    self.imageCache[cacheKey] = nil
   }
 }

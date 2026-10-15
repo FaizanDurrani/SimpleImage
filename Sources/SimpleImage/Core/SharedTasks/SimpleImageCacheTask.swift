@@ -7,27 +7,33 @@
 
 
 import Foundation
-import UIKit
 
+/// Loads a processed image from the processed disk cache.
 final class SimpleImageCacheTask: SimpleImageSharedTask, @unchecked Sendable {
   init(
     imageRequest: SimpleImageRequest,
-    imageCache: SimpleImageCache,
-    completionHandler: @escaping @Sendable (SimpleImageSharedTask, Result<UIImage, Error>, String?) -> Void,
+    processedDiskCache: SimpleImageDataCaching,
+    memoryCache: SimpleImageMemoryCaching,
+    decoders: [any SimpleImageDecoder],
+    onFinish: @escaping @Sendable (SimpleImageSharedTask) -> Void,
   ) {
-    super.init(request: imageRequest.urlRequest, completionHandler: completionHandler)
+    super.init(request: imageRequest.urlRequest, onFinish: onFinish)
     
     self.state = .waiting { [weak self] in
       guard let self else { return }
       
       do {
-        if let image = try await imageCache.retrieveImage(forKey: imageRequest.cacheKey) {
-          self.finish(with: .success(image), cacheKey: nil)
-        } else {
-          self.finish(with: .failure(SimpleImageError.cacheMiss(cacheKey: imageRequest.cacheKey)), cacheKey: nil)
+        guard let data = try? await processedDiskCache.data(forKey: imageRequest.cacheKey) else {
+          throw SimpleImageError.cacheMiss(cacheKey: imageRequest.cacheKey)
         }
+        
+        try Task.checkCancellation()
+        let image = try await decoders.decode(processedImageData: data)
+        
+        memoryCache.store(image, forKey: imageRequest.cacheKey)
+        self.finish(with: .success(.image(image)))
       } catch {
-        self.finish(with: .failure(error), cacheKey: nil)
+        self.finish(with: .failure(error))
       }
     }
   }

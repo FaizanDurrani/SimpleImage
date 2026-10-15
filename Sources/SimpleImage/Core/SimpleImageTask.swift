@@ -7,14 +7,18 @@
 
 
 import Foundation
-import UIKit
 
 public final class SimpleImageTask: Sendable {
+  enum Stage {
+    case processedCache
+    case download
+    case decoding
+    case processing
+  }
+  
   enum State {
     case initialising
-    case cacheTask(SimpleImageCacheTask)
-    case downloadTask(SimpleImageDownloadTask)
-    case processingTask(SimpleImageProcessingTask)
+    case running(Stage, SimpleImageSharedTask)
     case cancelled
     case finished
   }
@@ -32,7 +36,7 @@ public final class SimpleImageTask: Sendable {
   private let imageManager: SimpleImageManager?
   private nonisolated(unsafe) var state: State
   
-  private let completionHandler: @Sendable (SimpleImageTask, Result<UIImage, Error>, String?) -> Void
+  private let completionHandler: @Sendable (SimpleImageTask, Result<SimpleImageStageOutput, Error>) -> Void
   private let lock = NSLock()
   private let progressHandler: SimpleImageManager.ProgressHandler?
   
@@ -40,7 +44,7 @@ public final class SimpleImageTask: Sendable {
     imageRequest: SimpleImageRequest,
     imageManager: SimpleImageManager,
     progressHandler: SimpleImageManager.ProgressHandler?,
-    completionHandler: @escaping @Sendable (SimpleImageTask, Result<UIImage, Error>, String?) -> Void
+    completionHandler: @escaping @Sendable (SimpleImageTask, Result<SimpleImageStageOutput, Error>) -> Void
   ) {
     self.progressHandler = progressHandler
     self.id = UUID()
@@ -63,13 +67,10 @@ public final class SimpleImageTask: Sendable {
       }
     }
     guard let previousState else { return }
-    switch previousState {
-    case .cacheTask(let task): task.detach(task: self)
-    case .downloadTask(let task): task.detach(task: self)
-    case .processingTask(let task): task.detach(task: self)
-    default: break
+    if case .running(_, let task) = previousState {
+      task.detach(task: self)
     }
-    completionHandler(self, .failure(CancellationError()), nil)
+    completionHandler(self, .failure(CancellationError()))
   }
 
   func reportProgress(_ fraction: Double) {
@@ -83,77 +84,65 @@ public final class SimpleImageTask: Sendable {
   }
 
   private func beginImageLoading() {
-    if self.imageRequest.processors.isEmpty {
+    guard let imageManager else { return }
+    
+    if let image = imageManager.memoryCache.image(forKey: self.imageRequest.cacheKey) {
+      self.finishLoading(with: .success(.image(image)))
+    } else if self.imageRequest.processors.isEmpty {
       self.loadImageFromNetwork()
     } else {
-      self.loadImageFromCache()
+      self.run(.processedCache) { imageManager in
+        imageManager.processedCacheTask(request: self.imageRequest)
+      }
     }
   }
   
-  private func loadImageFromCache() {
+  private func loadOriginalImage() {
     guard let imageManager else { return }
     
-    let internalTask = imageManager.cacheTask(request: self.imageRequest)
-    let installed: Bool
-    
-    self.lock.lock()
-    switch self.state {
-      case .cacheTask(let currentTask) where currentTask !== internalTask:
-        self.state = .cacheTask(internalTask)
-        installed = true
-      
-      case .initialising:
-        self.state = .cacheTask(internalTask)
-        installed = true
-        
-      default:
-        installed = false
-    }
-    self.lock.unlock()
-    
-    guard installed else {
-      internalTask.detach(task: self)
-      return
-    }
-    
-    switch internalTask.attach(task: self) {
-      case .attached:
-        let isStillCurrent = self.lock.withLock {
-          if case .cacheTask(let currentTask) = self.state, currentTask === internalTask {
-            return true
-          }
-          
-          return false
-        }
-
-        if !isStillCurrent {
-          internalTask.detach(task: self)
-        }
-        
-      case .finished(let result):
-        self.processImageResult(result)
-      case .cancelled:
-        self.loadImageFromCache()
+    if let image = imageManager.memoryCache.image(forKey: self.imageRequest.unprocessedCacheKey) {
+      self.processImage(image)
+    } else {
+      self.loadImageFromNetwork()
     }
   }
   
   private func loadImageFromNetwork() {
+    self.run(.download) { imageManager in
+      imageManager.downloadTask(request: self.imageRequest)
+    }
+  }
+  
+  private func decodeImage(_ rawImage: RawImage, isFromDiskCache: Bool) {
+    self.run(.decoding) { imageManager in
+      imageManager.decodingTask(request: self.imageRequest, rawImage: rawImage, isFromDiskCache: isFromDiskCache)
+    }
+  }
+  
+  private func processImage(_ image: any ProcessedImage) {
+    self.run(.processing) { imageManager in
+      imageManager.processingTask(request: self.imageRequest, image: image)
+    }
+  }
+  
+  /// Installs and attaches to the shared task for `stage`, retrying if the
+  /// shared task was cancelled by its last subscriber in the meantime.
+  private func run(_ stage: Stage, makeTask: (SimpleImageManager) -> SimpleImageSharedTask) {
     guard let imageManager else { return }
     
-    let internalTask = imageManager.downloadTask(request: self.imageRequest)
+    let internalTask = makeTask(imageManager)
     let installed: Bool
     
     self.lock.lock()
     switch self.state {
-      case .downloadTask(let currentTask) where currentTask !== internalTask:
-        self.state = .downloadTask(internalTask)
-        installed = true
-      
-      case .initialising, .cacheTask:
-        self.state = .downloadTask(internalTask)
+      case .running(_, let currentTask) where currentTask === internalTask:
+        installed = false
+        
+      case .initialising, .running:
+        self.state = .running(stage, internalTask)
         installed = true
         
-      default:
+      case .cancelled, .finished:
         installed = false
     }
     self.lock.unlock()
@@ -166,7 +155,7 @@ public final class SimpleImageTask: Sendable {
     switch internalTask.attach(task: self) {
       case .attached:
         let isStillCurrent = self.lock.withLock {
-          if case .downloadTask(let currentTask) = self.state, currentTask === internalTask {
+          if case .running(_, let currentTask) = self.state, currentTask === internalTask {
             return true
           }
           
@@ -178,90 +167,47 @@ public final class SimpleImageTask: Sendable {
         }
         
       case .finished(let result):
-        self.processImageResult(result)
+        self.processStageResult(result, from: internalTask)
+        
       case .cancelled:
-        self.loadImageFromNetwork()
+        self.run(stage, makeTask: makeTask)
     }
   }
   
-  private func processImage(_ image: UIImage) {
-    guard let imageManager else { return }
-    
-    let internalTask = imageManager.processingTask(request: self.imageRequest, image: image)
-    let installed: Bool
-    
-    self.lock.lock()
-    switch self.state {
-      case .processingTask(let currentTask) where currentTask !== internalTask:
-        self.state = .processingTask(internalTask)
-        installed = true
+  func processStageResult(_ result: Result<SimpleImageStageOutput, Error>, from sharedTask: SimpleImageSharedTask) {
+    let stage: Stage? = self.lock.withLock {
+      if case .running(let stage, let currentTask) = self.state, currentTask === sharedTask {
+        return stage
+      }
       
-      case .downloadTask:
-        self.state = .processingTask(internalTask)
-        installed = true
+      return nil
+    }
+    
+    guard let stage else { return }
+    
+    switch (stage, result) {
+      case (.processedCache, .failure):
+        self.loadOriginalImage()
+        
+      case (.download, .success(.raw(let rawImage, let isFromDiskCache))):
+        self.decodeImage(rawImage, isFromDiskCache: isFromDiskCache)
+        
+      case (.decoding, .success(.image(let image))) where !self.imageRequest.processors.isEmpty:
+        self.processImage(image)
         
       default:
-        installed = false
-    }
-    self.lock.unlock()
-    
-    guard installed else {
-      internalTask.detach(task: self)
-      return
-    }
-    
-    switch internalTask.attach(task: self) {
-      case .attached:
-        let isStillCurrent = self.lock.withLock {
-          if case .processingTask(let currentTask) = self.state, currentTask === internalTask {
-            return true
-          }
-          
-          return false
-        }
-
-        if !isStillCurrent {
-          internalTask.detach(task: self)
-        }
-        
-      case .finished(let result):
-        self.processImageResult(result)
-      case .cancelled:
-        self.processImage(image)
+        self.finishLoading(with: result)
     }
   }
   
-  func processImageResult(_ result: Result<UIImage, Error>) {
-    let state = self.lock.withLock { self.state }
-    
-    switch (state, result) {
-      case (.cacheTask(let simpleImageCacheTask), .failure(let image)):
-        self.loadImageFromNetwork()
-        
-      case (.downloadTask, .success(let image)) where !self.imageRequest.processors.isEmpty:
-        self.processImage(image)
-        
-      case (.processingTask, .success):
-        self.finishLoading(with: result, cacheKey: self.imageRequest.cacheKey)
-        
-      case (.cacheTask, let result),
-        (.downloadTask, let result),
-        (.processingTask, let result):
-        self.finishLoading(with: result, cacheKey: nil)
-        
-      case (.initialising, _), (.cancelled, _), (.finished, _):
-        break
-    }
-  }
-  
-  private func finishLoading(with result: Result<UIImage, Error>, cacheKey: String?) {
+  private func finishLoading(with result: Result<SimpleImageStageOutput, Error>) {
     self.lock.lock()
     switch self.state {
-      case .cacheTask, .downloadTask, .processingTask:
+      case .initialising, .running:
         self.state = .finished
         self.lock.unlock()
         
-        self.completionHandler(self, result, cacheKey)
+        self.completionHandler(self, result)
       default:
         self.lock.unlock()
     }

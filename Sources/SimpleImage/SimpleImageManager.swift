@@ -6,9 +6,8 @@
 //
 
 import Foundation
-import UIKit
 
-enum SimpleImageError: Error {
+public enum SimpleImageError: Error {
   case invalidImageData
   case cacheMiss(cacheKey: String)
 }
@@ -18,27 +17,54 @@ public final class SimpleImageManager: Sendable, Hashable {
   public func hash(into hasher: inout Hasher) { hasher.combine(ObjectIdentifier(self)) }
 
   public let imageLoader: SimpleImageLoader
-  public let imageCache: SimpleImageCache
+  public let memoryCache: SimpleImageMemoryCaching
+  public let originalDiskCache: SimpleImageDataCaching
+  public let processedDiskCache: SimpleImageDataCaching
+  public let decoders: [any SimpleImageDecoder]
   public let imageTransformers: [SimpleImageTransformer]
   
-  private nonisolated(unsafe) var cacheTasks: [String: SimpleImageCacheTask] = [:]
-  private nonisolated(unsafe) var downloadTasks: [String: SimpleImageDownloadTask] = [:]
-  private nonisolated(unsafe) var processingTasks: [String: SimpleImageProcessingTask] = [:]
+  private let processedCacheTasks = SimpleImageSharedTaskRegistry<SimpleImageCacheTask>()
+  private let downloadTasks = SimpleImageSharedTaskRegistry<SimpleImageDownloadTask>()
+  private let decodingTasks = SimpleImageSharedTaskRegistry<SimpleImageDecodingTask>()
+  private let processingTasks = SimpleImageSharedTaskRegistry<SimpleImageProcessingTask>()
   
-  private let lock = NSLock()
-  
+  /// - Parameters:
+  ///   - memoryCache: Holds processed, ready to display images.
+  ///   - originalDiskCache: Holds the original bytes returned by requests.
+  ///   - processedDiskCache: Holds encoded results of processors. Use a different store than `originalDiskCache`.
+  ///   - decoders: Tried in order for each image format; put specialised decoders before `UIImageDecoder`,
+  ///     e.g. `[WebPImageDecoder(), UIImageDecoder()]` to keep the original WebP bytes.
   public init(
     imageLoader: SimpleImageLoader,
-    imageCache: SimpleImageCache,
-    imageTransformers: [SimpleImageTransformer]
+    memoryCache: SimpleImageMemoryCaching,
+    originalDiskCache: SimpleImageDataCaching,
+    processedDiskCache: SimpleImageDataCaching,
+    decoders: [any SimpleImageDecoder] = [UIImageDecoder()],
+    imageTransformers: [SimpleImageTransformer] = []
   ) {
     self.imageLoader = imageLoader
-    self.imageCache = imageCache
+    self.memoryCache = memoryCache
+    self.originalDiskCache = originalDiskCache
+    self.processedDiskCache = processedDiskCache
+    self.decoders = decoders
     self.imageTransformers = imageTransformers
   }
   
-  public typealias CompletionHandler = @Sendable @MainActor (Result<UIImage, Error>) -> Void
+  public typealias CompletionHandler = @Sendable @MainActor (Result<any ProcessedImage, Error>) -> Void
   public typealias ProgressHandler = @Sendable (Double) -> Void
+
+  /// Returns the processed image for the request if it's in the memory cache.
+  public func cachedImage(
+    request: URLRequest,
+    processors: [any SimpleImageProcessor] = []
+  ) -> (any ProcessedImage)? {
+    self.memoryCache.image(
+      forKey: SimpleImageRequest(
+        urlRequest: request,
+        processors: processors
+      ).cacheKey
+    )
+  }
 
   @discardableResult
   public func retrieveImage(
@@ -64,7 +90,11 @@ public final class SimpleImageManager: Sendable, Hashable {
       imageRequest: imageRequest,
       imageManager: self,
       progressHandler: progressHandler,
-      completionHandler: { _, result, _ in
+      completionHandler: { _, result in
+        let result = result.flatMap { output -> Result<any ProcessedImage, Error> in
+          guard case .image(let image) = output else { return .failure(SimpleImageError.invalidImageData) }
+          return .success(image)
+        }
         Task { @MainActor in completion(result) }
       }
     )
@@ -74,7 +104,7 @@ public final class SimpleImageManager: Sendable, Hashable {
     request: URLRequest,
     processors: [any SimpleImageProcessor] = [],
     progressHandler: ProgressHandler? = nil
-  ) async throws -> UIImage {
+  ) async throws -> any ProcessedImage {
     let cancellation = ImageTaskCancellation()
     return try await withTaskCancellationHandler {
       try Task.checkCancellation()
@@ -92,112 +122,54 @@ public final class SimpleImageManager: Sendable, Hashable {
     }
   }
 
-  func cacheTask(request: SimpleImageRequest) -> SimpleImageCacheTask {
-    self.lock.withLock {
-      let taskIdentifier = request.cacheKey
-      
-      if let task = self.cacheTasks[taskIdentifier], !task.isCancelled {
-        return task
-      }
-      
-      let task = SimpleImageCacheTask(
+  func processedCacheTask(request: SimpleImageRequest) -> SimpleImageCacheTask {
+    self.processedCacheTasks.task(forKey: request.cacheKey) { onFinish in
+      SimpleImageCacheTask(
         imageRequest: request,
-        imageCache: self.imageCache,
-        completionHandler: { task, imageResult, cacheKey in
-          self.lock.withLock {
-            if self.cacheTasks[taskIdentifier] === task {
-              self.cacheTasks.removeValue(forKey: taskIdentifier)
-            }
-          }
-        }
+        processedDiskCache: self.processedDiskCache,
+        memoryCache: self.memoryCache,
+        decoders: self.decoders,
+        onFinish: onFinish
       )
-      
-      self.cacheTasks[taskIdentifier] = task
-      return task
     }
   }
   
   func downloadTask(request: SimpleImageRequest) -> SimpleImageDownloadTask {
-    self.lock.withLock {
-      let taskIdentifier = request.unprocessedCacheKey
-      
-      if let task = self.downloadTasks[taskIdentifier], !task.isCancelled {
-        return task
-      }
-      
-      let task = SimpleImageDownloadTask(
+    self.downloadTasks.task(forKey: request.unprocessedCacheKey) { onFinish in
+      SimpleImageDownloadTask(
         imageRequest: request,
         imageLoader: self.imageLoader,
         imageTransformers: self.imageTransformers,
-        imageCache: self.imageCache,
-        completionHandler: { task, imageResult, cacheKey in
-          if let cacheKey, case .success(let image) = imageResult {
-            Task {
-              do {
-                try await self.imageCache.cacheImage(image, forKey: cacheKey)
-              } catch {
-                // TODO: Implement erorr handling
-              }
-              
-              self.lock.withLock {
-                if self.downloadTasks[taskIdentifier] === task {
-                  self.downloadTasks.removeValue(forKey: taskIdentifier)
-                }
-              }
-            }
-          } else {
-            self.lock.withLock {
-              if self.downloadTasks[taskIdentifier] === task {
-                self.downloadTasks.removeValue(forKey: taskIdentifier)
-              }
-            }
-          }
-        }
+        originalDiskCache: self.originalDiskCache,
+        onFinish: onFinish
       )
-      
-      self.downloadTasks[taskIdentifier] = task
-      return task
     }
   }
   
-  func processingTask(request: SimpleImageRequest, image: UIImage) -> SimpleImageProcessingTask {
-    self.lock.withLock {
-      let taskIdentifier = request.cacheKey
-      
-      if let task = self.processingTasks[taskIdentifier], !task.isCancelled {
-        return task
-      }
-      
-      let task = SimpleImageProcessingTask(
+  func decodingTask(request: SimpleImageRequest, rawImage: RawImage, isFromDiskCache: Bool) -> SimpleImageDecodingTask {
+    self.decodingTasks.task(forKey: request.unprocessedCacheKey) { onFinish in
+      SimpleImageDecodingTask(
+        imageRequest: request,
+        rawImage: rawImage,
+        isFromDiskCache: isFromDiskCache,
+        decoders: self.decoders,
+        memoryCache: self.memoryCache,
+        originalDiskCache: self.originalDiskCache,
+        onFinish: onFinish
+      )
+    }
+  }
+  
+  func processingTask(request: SimpleImageRequest, image: any ProcessedImage) -> SimpleImageProcessingTask {
+    self.processingTasks.task(forKey: request.cacheKey) { onFinish in
+      SimpleImageProcessingTask(
         imageRequest: request,
         image: image,
-        completionHandler: { task, imageResult, cacheKey in
-          if let cacheKey, case .success(let image) = imageResult {
-            Task {
-              do {
-                try await self.imageCache.cacheImage(image, forKey: cacheKey)
-              } catch {
-                // TODO: Implement erorr handling
-              }
-              
-              self.lock.withLock {
-                if self.processingTasks[taskIdentifier] === task {
-                  self.processingTasks.removeValue(forKey: taskIdentifier)
-                }
-              }
-            }
-          } else {
-            self.lock.withLock {
-              if self.processingTasks[taskIdentifier] === task {
-                self.processingTasks.removeValue(forKey: taskIdentifier)
-              }
-            }
-          }
-        }
+        decoders: self.decoders,
+        memoryCache: self.memoryCache,
+        processedDiskCache: self.processedDiskCache,
+        onFinish: onFinish
       )
-      
-      self.processingTasks[taskIdentifier] = task
-      return task
     }
   }
 }

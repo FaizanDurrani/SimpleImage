@@ -7,7 +7,6 @@
 
 
 import Foundation
-import UIKit
 
 public struct SimpleImageRequest: Sendable, Equatable {
   public let urlRequest: URLRequest
@@ -24,8 +23,12 @@ public struct SimpleImageRequest: Sendable, Equatable {
     
     self.unprocessedCacheKey = urlRequest.url!.absoluteString
     
-    let processorIdentifier = processors.lazy.map { "\($0.identifier)" }.joined(separator: "-")
-    self.cacheKey = "\(urlRequest.url!.absoluteString)--\(processorIdentifier)"
+    if processors.isEmpty {
+      self.cacheKey = self.unprocessedCacheKey
+    } else {
+      let processorIdentifier = processors.lazy.map { "\($0.identifier)" }.joined(separator: "-")
+      self.cacheKey = "\(urlRequest.url!.absoluteString)--\(processorIdentifier)"
+    }
   }
   
   public static func == (lhs: SimpleImageRequest, rhs: SimpleImageRequest) -> Bool {

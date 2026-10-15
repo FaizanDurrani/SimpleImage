@@ -24,6 +24,13 @@ let package = Package(
           name: "SimpleImageUIKit",
           targets: ["SimpleImageUIKit"]
         ),
+        .library(
+          name: "SimpleImageFLAnimatedImage",
+          targets: ["SimpleImageFLAnimatedImage"]
+        ),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/Flipboard/FLAnimatedImage.git", from: "1.0.16"),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -55,9 +62,17 @@ let package = Package(
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
         ),
+        .target(
+            name: "SimpleImageFLAnimatedImage",
+            dependencies: ["SimpleImage", "SimpleImageUIKit", "FLAnimatedImage"],
+            swiftSettings: [
+                .enableUpcomingFeature("ApproachableConcurrency"),
+            ],
+        ),
         .testTarget(
             name: "SimpleImageTests",
-            dependencies: ["SimpleImage"],
+            dependencies: ["SimpleImage", "SimpleImageUIKit", "SimpleImageCache", "SimpleImageFLAnimatedImage", "SimpleImageURLSessionLoader"],
+            path: "Tests/SimpleImageProtocolTests",
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],

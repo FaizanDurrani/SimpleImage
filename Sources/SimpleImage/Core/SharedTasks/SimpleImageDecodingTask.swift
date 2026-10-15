@@ -16,7 +16,6 @@ final class SimpleImageDecodingTask: SimpleImageSharedTask, @unchecked Sendable 
     rawImage: RawImage,
     isFromDiskCache: Bool,
     decoders: [any SimpleImageDecoder],
-    memoryCache: SimpleImageMemoryCaching,
     originalDiskCache: SimpleImageDataCaching,
     onFinish: @escaping @Sendable (SimpleImageSharedTask) -> Void,
   ) {
@@ -26,9 +25,10 @@ final class SimpleImageDecodingTask: SimpleImageSharedTask, @unchecked Sendable 
       guard let self else { return }
       
       do {
+        // Subscribers memory-cache the original only if they display it unprocessed.
         let image = try await decoders.decode(rawImage: rawImage)
+        try Task.checkCancellation()
         
-        memoryCache.store(image, forKey: imageRequest.unprocessedCacheKey)
         self.finish(with: .success(.image(image)))
         
         // Persist after delivering; the memory cache serves requests meanwhile.

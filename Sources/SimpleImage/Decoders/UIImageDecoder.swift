@@ -26,10 +26,13 @@ public struct UIImageDecoder: SimpleImageDecoder {
   
   /// Decodes `data` with `UIImage(data:)` and prepares it for display, off the caller's actor.
   @concurrent public static func decodedImage(from data: Data) async throws -> UIImage {
+    try Task.checkCancellation()
     guard let image = UIImage(data: data) else {
       throw SimpleImageError.invalidImageData
     }
     
+    // Preparing is the expensive part (a full-size bitmap); skip it once nobody wants the image.
+    try Task.checkCancellation()
     return await image.byPreparingForDisplay() ?? image
   }
 }

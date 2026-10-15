@@ -55,7 +55,8 @@ class SimpleImageSharedTask: @unchecked Sendable {
       switch self.state! {
         case .waiting(work: let work):
           self.children[task.id] = task
-          self.state = .working(Task(operation: work))
+          // Started from the main thread; don't inherit its priority and compete with scrolling.
+          self.state = .working(Task(priority: .medium, operation: work))
           return .attached
           
         case .working:

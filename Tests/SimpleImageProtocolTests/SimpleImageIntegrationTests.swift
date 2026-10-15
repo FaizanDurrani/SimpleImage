@@ -168,8 +168,17 @@ final class SimpleImageIntegrationTests: XCTestCase, @unchecked Sendable {
     XCTAssertTrue(result as? UIImage === output)
     XCTAssertTrue(processor.lastInput is UIImage)
     XCTAssertTrue(memory.image(forKey: request.cacheKey) as? UIImage === output)
-    XCTAssertNotNil(memory.image(forKey: request.unprocessedCacheKey))
-    XCTAssertFalse(memory.image(forKey: request.unprocessedCacheKey) as? UIImage === output)
+    XCTAssertNil(memory.image(forKey: request.unprocessedCacheKey), "processed requests don't memory-cache the original")
+  }
+
+  @MainActor
+  func testUnprocessedRequestMemoryCachesTheOriginal() async throws {
+    let url = URL(string: "https://images.test/unprocessed")!
+    let memory = TestMemoryCache()
+    let manager = SimpleImageManager.test(loader: StubLoader([url: Fixtures.png(.red)]), memoryCache: memory)
+    let result = try await manager.image(request: URLRequest(url: url))
+    let request = SimpleImageRequest(urlRequest: URLRequest(url: url), processors: [])
+    XCTAssertTrue(memory.image(forKey: request.unprocessedCacheKey) as? UIImage === result as? UIImage)
   }
 
   @MainActor

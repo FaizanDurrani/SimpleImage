@@ -26,6 +26,7 @@ public struct FLAnimatedImageDecoder: SimpleImageDecoder {
   }
   
   @concurrent private func decode(data: Data) async throws -> FLAnimatedProcessedImage {
+    try Task.checkCancellation()
     guard let animatedImage = FLAnimatedImage(animatedGIFData: data) else {
       throw SimpleImageError.invalidImageData
     }

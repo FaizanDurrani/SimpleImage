@@ -10,16 +10,18 @@ import Foundation
 public protocol SimpleImageDecoder: Sendable {
   func canDecode(_ format: SimpleImageFormat) -> Bool
   
+  @concurrent
   func decode(rawImage: RawImage) async throws -> any ProcessedImage
+  
+  /// Decodes bytes produced by `encode(processedImage:)`. Defaults to
+  /// `decode(rawImage:)`, for decoders whose encoded form is a regular image file.
+  @concurrent
+  func decode(processedImageData: Data) async throws -> any ProcessedImage
   
   /// Encodes a processed image for the processed disk cache, or returns `nil`
   /// when this decoder doesn't handle the image's type. The encoded bytes must
   /// sniff to a format this decoder `canDecode`.
   func encode(processedImage: any ProcessedImage) -> Data?
-  
-  /// Decodes bytes produced by `encode(processedImage:)`. Defaults to
-  /// `decode(rawImage:)`, for decoders whose encoded form is a regular image file.
-  func decode(processedImageData: Data) async throws -> any ProcessedImage
 }
 
 extension SimpleImageDecoder {

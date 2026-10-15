@@ -153,20 +153,20 @@ public final class SimpleImageManager: Sendable, Hashable {
         rawImage: rawImage,
         isFromDiskCache: isFromDiskCache,
         decoders: self.decoders,
-        memoryCache: self.memoryCache,
         originalDiskCache: self.originalDiskCache,
         onFinish: onFinish
       )
     }
   }
   
-  func processingTask(request: SimpleImageRequest, image: any ProcessedImage) -> SimpleImageProcessingTask {
+  func processingTask(request: SimpleImageRequest, input: SimpleImageProcessingInput) -> SimpleImageProcessingTask {
     self.processingTasks.task(forKey: request.cacheKey) { onFinish in
       SimpleImageProcessingTask(
         imageRequest: request,
-        image: image,
+        input: input,
         decoders: self.decoders,
         memoryCache: self.memoryCache,
+        originalDiskCache: self.originalDiskCache,
         processedDiskCache: self.processedDiskCache,
         onFinish: onFinish
       )

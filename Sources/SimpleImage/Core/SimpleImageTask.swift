@@ -101,7 +101,7 @@ public final class SimpleImageTask: Sendable {
     guard let imageManager else { return }
     
     if let image = imageManager.memoryCache.image(forKey: self.imageRequest.unprocessedCacheKey) {
-      self.processImage(image)
+      self.processImage(.decoded(image))
     } else {
       self.loadImageFromNetwork()
     }
@@ -119,9 +119,9 @@ public final class SimpleImageTask: Sendable {
     }
   }
   
-  private func processImage(_ image: any ProcessedImage) {
+  private func processImage(_ input: SimpleImageProcessingInput) {
     self.run(.processing) { imageManager in
-      imageManager.processingTask(request: self.imageRequest, image: image)
+      imageManager.processingTask(request: self.imageRequest, input: input)
     }
   }
   
@@ -190,10 +190,21 @@ public final class SimpleImageTask: Sendable {
         self.loadOriginalImage()
         
       case (.download, .success(.raw(let rawImage, let isFromDiskCache))):
-        self.decodeImage(rawImage, isFromDiskCache: isFromDiskCache)
+        if self.imageRequest.processors.first is any SimpleImageDataProcessor {
+          // Skip the full-size decode; the processor works from the bytes.
+          self.processImage(.raw(rawImage, isFromDiskCache: isFromDiskCache))
+        } else {
+          self.decodeImage(rawImage, isFromDiskCache: isFromDiskCache)
+        }
         
       case (.decoding, .success(.image(let image))) where !self.imageRequest.processors.isEmpty:
-        self.processImage(image)
+        self.processImage(.decoded(image))
+        
+      case (.decoding, .success(.image(let image))):
+        // Only originals displayed as-is are memory-cached, so processed requests
+        // (e.g. thumbnails) don't fill the cache with full-size images.
+        self.imageManager?.memoryCache.store(image, forKey: self.imageRequest.unprocessedCacheKey)
+        self.finishLoading(with: result)
         
       default:
         self.finishLoading(with: result)

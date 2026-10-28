@@ -21,7 +21,11 @@ public struct UIImageDecoder: SimpleImageDecoder {
   }
   
   public func encode(processedImage: any ProcessedImage) -> Data? {
-    (processedImage as? UIImage)?.pngData()
+    if #available(iOS 17.0, *) {
+      return (processedImage as? UIImage)?.heicData()
+    } else {
+      return (processedImage as? UIImage)?.pngData()
+    }
   }
   
   /// Decodes `data` with `UIImage(data:)` and prepares it for display, off the caller's actor.
